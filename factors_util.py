@@ -6,6 +6,8 @@ import yfinance as yf
 from statsmodels import regression
 from sklearn.linear_model import LassoCV
 import numpy as np
+from sklearn.preprocessing import StandardScaler
+from textwrap import fill
 
 def load_ff_factors(file_name: str) -> pd.DataFrame:
     """
@@ -45,6 +47,9 @@ def download_from_yf(ticker: str, start_date: str, end_date: str, field_name: st
     portfolio.index = portfolio.index.to_period('M')
     return portfolio
 
+def annualize_alpha(alpha_monthly: float) -> float:
+    return (1 + alpha_monthly)**12 - 1
+
 def factor_model_statsmodel(
     portfolio: pd.DataFrame, 
     factor_returns: pd.DataFrame, 
@@ -70,7 +75,13 @@ def factor_model_statsmodel(
     model = sm.OLS(y, X).fit()
     data['replicating'] = model.fittedvalues
     data['alpha'] = data['Excess_Portfolio'] - data['replicating']
-    cumulative = (1 + data[["Excess_Portfolio","replicating","alpha"]]).cumprod()
+    data['replicating_total'] = data['replicating'] + data[risk_free_column]
+    # cumulative = (1 + data[["Excess_Portfolio","replicating","alpha"]]).cumprod()
+    cumulative = pd.DataFrame({
+        "actual":        (1 + data["Portfolio"]).cumprod(),
+        "replicating":   (1 + data["replicating_total"]).cumprod(),
+        "alpha (residual)": (1 + data["alpha"]).cumprod(),
+    })
     return model, data, cumulative
 
 import matplotlib.pyplot as plt
@@ -116,18 +127,20 @@ def plot_model_statsmodel(
     """
     x_index = cumulative.index.to_timestamp()
     formula, rsq = get_formula_and_rsq(model)
+    alpha_ann = annualize_alpha(model.params["const"])
     
     fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(x_index, cumulative["Excess_Portfolio"], label="actual")
+    ax.plot(x_index, cumulative["actual"], label="actual")
     ax.plot(x_index, cumulative["replicating"], label="replicating")
-    ax.plot(x_index, cumulative["alpha"], label="alpha (residual)")
+    ax.plot(x_index, cumulative["alpha (residual)"], label="alpha (residual)")
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Growth (Starting at 1)")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
     # Normal title inside axes space
-    ax.set_title(plot_title, fontsize=14, pad=12)
+    # ax.set_title(plot_title, fontsize=14, pad=12)
+    ax.set_title(plot_title + f"\n(R² = {rsq:.3f}, α ≈ {alpha_ann:.2%}/yr)", pad=10, fontsize=14)
     
     # Put formula just under the title, but above the chart
     # plt.text(0.5, 0.8, formula,
@@ -148,7 +161,7 @@ def plot_model_statsmodel(
     plt.grid(True, alpha=0.3)
     plt.show()
 
-def factor_model_lasso(
+def factor_model_lasso_old(
     portfolio: pd.DataFrame, 
     factor_returns: pd.DataFrame, 
     factor_columns: list[str] = None,
@@ -191,12 +204,102 @@ def factor_model_lasso(
 
     return lasso, coefs, rsq, data, cumulative 
 
+def factor_model_lasso(
+    portfolio: pd.DataFrame,
+    factor_returns: pd.DataFrame,
+    factor_columns: list[str] | None = None,
+    risk_free_column: str = "RF",
+    use_1se_rule: bool = False,        # pick sparser λ if True
+    cv: int = 5,
+) -> tuple[LassoCV, pd.Series, float, float, pd.DataFrame, pd.DataFrame]:
+    """
+    Lasso regression of portfolio excess returns on factors.
+
+    Returns:
+      lasso (fitted estimator on standardized X),
+      coefs (Series of betas in original units),
+      intercept (alpha in original units),
+      rsq (R^2 in-sample on training data),
+      data (joined DataFrame with columns: Excess_Portfolio, Replicating_Lasso, Alpha_Lasso),
+      cumulative (cumprod of 1 + those three series)
+    """
+    df = portfolio.join(factor_returns, how="inner").copy()
+
+    # Decide factor columns (exclude RF)
+    fac_cols = factor_columns or [c for c in factor_returns.columns if c != risk_free_column]
+
+    # Excess portfolio return (make sure portfolio is also in decimals)
+    df["Excess_Portfolio"] = df["Portfolio"] - df[risk_free_column]
+
+    X = df[fac_cols].astype(float).to_numpy()
+    y = df["Excess_Portfolio"].astype(float).to_numpy()
+
+    # Standardize X for L1 penalty
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+
+    # Fit LassoCV
+    lcv = LassoCV(cv=cv, alphas=200, random_state=0).fit(Xs, y)
+
+    # Optional: 1-SE rule for a sparser model
+    if use_1se_rule:
+        # mse_path_: shape (n_alphas, n_folds); alphas_ decreasing
+        mse_mean = lcv.mse_path_.mean(axis=1)
+        mse_std = lcv.mse_path_.std(axis=1, ddof=1)
+        min_idx = mse_mean.argmin()
+        thresh = mse_mean[min_idx] + mse_std[min_idx]    # 1-SE threshold
+        # pick the LARGEST alpha whose mean MSE <= threshold (sparser)
+        idx_1se = np.where(mse_mean <= thresh)[0][0]
+        alpha_1se = lcv.alphas_[idx_1se]
+        # refit at alpha_1se on same standardized X
+        from sklearn.linear_model import Lasso
+        lasso = Lasso(alpha=alpha_1se, fit_intercept=True).fit(Xs, y)
+    else:
+        lasso = lcv
+
+    # ---- Back-transform coefficients to original feature units ----
+    # lasso.coef_ are for standardized X
+    beta_std = lasso.coef_
+    sigma = scaler.scale_
+    mu = scaler.mean_
+
+    beta = beta_std / sigma
+    intercept = lasso.intercept_ - np.dot(beta, mu)
+
+    coefs = pd.Series(beta, index=fac_cols)
+
+    # In-sample R^2 on training data
+    rsq = lasso.score(Xs, y)
+
+    # Predictions in returns space
+    y_hat = lasso.predict(Xs)  # same as intercept + (X - mu) @ (beta_std)
+    df["Replicating_Lasso"] = y_hat
+    
+    # df["Alpha_Lasso"] = df["Excess_Portfolio"] - df["Replicating_Lasso"]
+    # cumulative = (1 + df[["Excess_Portfolio", "Replicating_Lasso", "Alpha_Lasso"]]).cumprod()
+
+    df["Alpha_Lasso"] = df["Excess_Portfolio"] - y_hat
+    
+    # total returns
+    df["Portfolio_Total"]   = df["Portfolio"]          # already total (decimal)
+    df["Replicating_Total"] = df["Replicating_Lasso"] + df[risk_free_column]
+    df["Alpha_Total"]       = df["Alpha_Lasso"]        # alpha stays excess
+    
+    # cumulative growth (start at 1)
+    cumulative = pd.DataFrame({
+        "actual":        (1 + df["Portfolio_Total"]).cumprod(),
+        "replicating":   (1 + df["Replicating_Total"]).cumprod(),
+        "alpha (residual)": (1 + df["Alpha_Total"]).cumprod(),
+    })
+
+    return lcv, coefs, intercept, rsq, df, cumulative
+
 def sign(val):
     if val >= 0:
         return "+"
     return "-"
     
-def get_formula_lasso(lasso, coefs) -> str:
+def get_formula_lasso_old(lasso, coefs) -> str:
     # Build regression equation string from model parameters
     alpha = lasso.intercept_
     betas = coefs
@@ -207,15 +310,65 @@ def get_formula_lasso(lasso, coefs) -> str:
         formula += f"\n {sign(coef)} {abs(coef):.4f}·{name}"
     return formula
 
+def get_formula_lasso(
+    intercept: float,
+    coefs: pd.Series,
+    *,
+    sort_by_abs: bool = True,   # show largest loadings first
+    zero_tol: float = 5e-5,     # hide “effectively zero” betas
+    coef_fmt: str = "{:+.4f}",  # sign + 4 decimals
+    wrap_chars: int | None = 80 # soft wrap long lines; None = no wrap
+) -> str:
+    """
+    Build a readable multiline formula string like:
+
+      y = 0.0094
+       + 0.0459·Mkt-RF
+       - 0.0047·SMB
+       + 0.0019·HML
+       + 0.0011·RMW
+
+    Args:
+      intercept: alpha in *original return units* (e.g., monthly decimal)
+      coefs: pd.Series of betas in original units, index = factor names
+    """
+    # Optionally drop near-zeros for cleaner display
+    show = coefs.copy()
+    show[show.abs() < zero_tol] = 0.0
+
+    if sort_by_abs:
+        show = show.reindex(show.abs().sort_values(ascending=False).index)
+
+    lines = [f"y = {intercept:.4f}"]
+    for name, beta in show.items():
+        if beta == 0.0:  # skip if zero after tolerance
+            continue
+        # U+00B7 is a middle dot
+        lines.append(f"{coef_fmt.format(beta)}·{name}")
+
+    # If everything got zeroed, still show one zero term (optional)
+    if len(lines) == 1:
+        # keep the largest original (even if tiny) so the user sees structure
+        name = coefs.abs().idxmax()
+        lines.append(f"{coef_fmt.format(coefs[name])}·{name}")
+
+    s = "\n ".join([lines[0]] + lines[1:])  # place '+'/'-' on each line start
+
+    if wrap_chars:
+        # wrap each existing line separately to keep manual newlines
+        s = "\n".join(fill(line, width=wrap_chars) for line in s.splitlines())
+
+    return s
+
 def plot_model_lasso_old(
     cumulative: pd.DataFrame,
-    lasso: LassoCV,
+    intercept: float,
     coefs: pd.Series,
     rsq: float,
     plot_title: str = "Portfolio vs Replicating Factor Model vs Alpha"
 ):
     x_index = cumulative.index.to_timestamp()
-    formula = get_formula_lasso(lasso, coefs)
+    formula = get_formula_lasso(intercept, coefs)
     
     plt.figure(figsize=(12,6))
     plt.plot(x_index, cumulative["Excess_Portfolio"], label="actual")
@@ -326,22 +479,24 @@ def draw_formula_top(fig, formula, fontsize=10, color="darkblue", pad=4):
 
     return txt, h_frac
 
-def plot_model_lasso(cumulative, lasso, coefs, rsq,
+def plot_model_lasso(cumulative, intercept, coefs, rsq,
                      plot_title="Portfolio vs Replicating Factor Model vs Alpha"):
     x_index = cumulative.index.to_timestamp()
-    formula = get_formula_lasso(lasso, coefs)
+    formula = get_formula_lasso(intercept, coefs)
+    alpha_ann = annualize_alpha(intercept)
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(x_index, cumulative["Excess_Portfolio"], label="actual")
-    ax.plot(x_index, cumulative["Replicating_Lasso"], label="replicating")
-    ax.plot(x_index, cumulative["Alpha_Lasso"], label="alpha (residual)")
+    ax.plot(x_index, cumulative["actual"], label="actual")
+    ax.plot(x_index, cumulative["replicating"], label="replicating")
+    ax.plot(x_index, cumulative["alpha (residual)"], label="alpha (residual)")
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Growth (Starting at 1)")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
     # Normal title inside axes space
-    ax.set_title(plot_title, fontsize=14, pad=12)
+    # ax.set_title(plot_title, fontsize=14, pad=12)
+    ax.set_title(plot_title + f"\n(R² = {rsq:.3f}, α ≈ {alpha_ann:.2%}/yr)", pad=10, fontsize=14)
 
     # Formula at very top of figure
     # fig.text(0.5, 0.85, formula,
