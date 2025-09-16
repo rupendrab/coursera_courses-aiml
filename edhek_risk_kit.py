@@ -49,6 +49,24 @@ def get_ind_returns():
     ind.columns = ind.columns.str.strip()
     return ind
 
+def get_ind_size():
+    """
+    Get monthly average size of companies in index funds
+    """
+    ind = pd.read_csv("data/ind30_m_size.csv", header=0, index_col=0)
+    ind.index = pd.to_datetime(ind.index, format="%Y%m").to_period('M')
+    ind.columns = ind.columns.str.strip()
+    return ind
+
+def get_ind_nfirms():
+    """
+    Get monthly count of companies in index funds
+    """
+    ind = pd.read_csv("data/ind30_m_nfirms.csv", header=0, index_col=0)
+    ind.index = pd.to_datetime(ind.index, format="%Y%m").to_period('M')
+    ind.columns = ind.columns.str.strip()
+    return ind
+
 def skewness(r) -> pd.Series:
     """
     Alternative to scipy.stats.skew()
